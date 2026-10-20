@@ -91,6 +91,10 @@ pub fn definitions() -> Value {
                     "max_elements": {
                         "type": "integer",
                         "description": "最多返回多少个控件，默认 400。"
+                    },
+                    "include_popups": {
+                        "type": "boolean",
+                        "description": "是否把该窗口弹出的菜单/下拉框/对话框一并合并进来，默认 true。合并的浮层会标成 Popup 并缩进一层。"
                     }
                 },
                 "required": ["hwnd"],
@@ -355,7 +359,7 @@ fn wait_for(hwnd: i64, name: &str, timeout_ms: u64) -> Result<String> {
     let needle = name.to_lowercase();
     let started = std::time::Instant::now();
     loop {
-        if let Ok(nodes) = uia::observe(hwnd, 12, 600) {
+        if let Ok(nodes) = uia::observe(hwnd, 12, 600, true) {
             let hit = nodes.iter().any(|node| {
                 node.name.to_lowercase().contains(&needle)
                     || node.automation_id.to_lowercase().contains(&needle)
@@ -385,10 +389,10 @@ fn run_step(step: &Value, default_hwnd: Option<i64>) -> Result<String> {
             let id = str_arg(step, "id")?;
             let text = str_arg(step, "text")?;
             let (how, verified) = uia::set_value(id, text)?;
-            Ok(if verified {
-                format!("{how}，已回读确认")
-            } else {
-                format!("{how}，回读内容不一致")
+            Ok(match verified {
+                Some(true) => format!("{how}，已回读确认"),
+                Some(false) => format!("{how}，回读内容不一致"),
+                None => format!("{how}，回读无法校验"),
             })
         }
         "click" => {
@@ -528,7 +532,11 @@ pub fn call(params: &Value) -> std::result::Result<Value, (i64, String)> {
                 let hwnd = int_arg(&args, "hwnd")?;
                 let depth = opt_int(&args, "max_depth").unwrap_or(12).clamp(1, 32) as u32;
                 let max_elements = opt_int(&args, "max_elements").unwrap_or(400).clamp(1, 3000) as usize;
-                let nodes = uia::observe(hwnd, depth, max_elements)?;
+                let include_popups = args
+                    .get("include_popups")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let nodes = uia::observe(hwnd, depth, max_elements, include_popups)?;
                 let info = window::get(hwnd)?;
                 text_result(format!(
                     "窗口 \"{}\" hwnd={} 控件 {} 个\n{}",
@@ -548,11 +556,12 @@ pub fn call(params: &Value) -> std::result::Result<Value, (i64, String)> {
                 let text = str_arg(&args, "text")?;
                 let (how, verified) = uia::set_value(id, text)?;
                 let count = text.chars().count();
-                text_result(if verified {
-                    format!("{id} → {how}（{count} 个字符，已回读确认）")
-                } else {
-                    format!("{id} → {how}（{count} 个字符，但回读内容不一致，建议先 observe 确认）")
-                })
+                let note = match verified {
+                    Some(true) => "已回读确认",
+                    Some(false) => "回读内容不一致，建议先 observe 确认",
+                    None => "已输入，文档类控件无法回读校验，请用截图确认",
+                };
+                text_result(format!("{id} → {how}（{count} 个字符，{note}）"))
             }
             "act" => act(&args)?,
             "focus_window" => {

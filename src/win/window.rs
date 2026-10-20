@@ -10,9 +10,10 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow,
-    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    SetForegroundWindow, ShowWindow, SW_RESTORE,
+    BringWindowToTop, EnumWindows, GetClassNameW, GetForegroundWindow, GetLastActivePopup,
+    GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
+    IsWindowVisible, SetForegroundWindow, SetWindowPos, ShowWindow, GWL_EXSTYLE, GW_OWNER,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOMOVE, SWP_NOSIZE, SW_RESTORE, WS_EX_TOOLWINDOW,
 };
 
 use super::{hwnd_value, to_hwnd};
@@ -24,6 +25,12 @@ const DWMWA_CLOAKED: u32 = 14;
 #[link(name = "dwmapi")]
 extern "system" {
     fn DwmGetWindowAttribute(hwnd: HWND, attr: u32, pv: *mut c_void, cb: u32) -> i32;
+}
+
+// 前台锁把 SetForegroundWindow 挡掉时的最后手段
+#[link(name = "user32")]
+extern "system" {
+    fn SwitchToThisWindow(hwnd: HWND, alt_tab: BOOL);
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,7 +233,8 @@ pub fn capabilities(hwnd_value: i64) -> Result<Capabilities> {
     Ok(caps)
 }
 
-/// 把目标窗口切到前台。Windows 对后台进程抢焦点有限制，这里用 AttachThreadInput 绕过。
+/// 把目标窗口切到前台。Windows 对后台进程抢焦点有限制，这里用三种手段叠加：
+/// AttachThreadInput、临时置顶再取消、SwitchToThisWindow。
 pub fn focus(hwnd_value: i64) -> Result<WindowInfo> {
     let hwnd = to_hwnd(hwnd_value)?;
     unsafe {
@@ -234,21 +242,57 @@ pub fn focus(hwnd_value: i64) -> Result<WindowInfo> {
             let _ = ShowWindow(hwnd, SW_RESTORE);
         }
         let foreground = GetForegroundWindow();
-        let target_thread = GetWindowThreadProcessId(hwnd, None);
-        let foreground_thread = GetWindowThreadProcessId(foreground, None);
-        let current_thread = GetCurrentThreadId();
-        let attached = foreground_thread != 0
-            && foreground_thread != current_thread
-            && AttachThreadInput(current_thread, foreground_thread, TRUE).as_bool();
-        let _ = BringWindowToTop(hwnd);
-        let _ = SetForegroundWindow(hwnd);
-        if attached {
-            let _ = AttachThreadInput(current_thread, foreground_thread, BOOL(0));
+        if foreground != hwnd {
+            let foreground_thread = GetWindowThreadProcessId(foreground, None);
+            let current_thread = GetCurrentThreadId();
+            let attached = foreground_thread != 0
+                && foreground_thread != current_thread
+                && AttachThreadInput(current_thread, foreground_thread, TRUE).as_bool();
+            let _ = BringWindowToTop(hwnd);
+            let _ = SetForegroundWindow(hwnd);
+            if attached {
+                let _ = AttachThreadInput(current_thread, foreground_thread, BOOL(0));
+            }
+            if GetForegroundWindow() != hwnd {
+                // 前台锁生效时 SetForegroundWindow 会被忽略，临时置顶能绕过去
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE,
+                );
+                let _ = SetWindowPos(
+                    hwnd,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE,
+                );
+                let _ = SetForegroundWindow(hwnd);
+            }
+            if GetForegroundWindow() != hwnd {
+                SwitchToThisWindow(hwnd, TRUE);
+            }
         }
-        let _ = target_thread;
-        super::sleep_ms(60);
+        if GetForegroundWindow() != hwnd {
+            eprintln!("focus: 无法把 hwnd={} 切到前台，后续键盘输入可能无效", hwnd_value);
+        }
+        super::sleep_ms(80);
     }
     get(hwnd_value)
+}
+
+/// 目标窗口当前是否处于前台。键盘注入只对前台窗口有效。
+pub fn is_foreground(hwnd_value: i64) -> bool {
+    match to_hwnd(hwnd_value) {
+        Ok(hwnd) => unsafe { GetForegroundWindow() == hwnd },
+        Err(_) => false,
+    }
 }
 
 /// 客户区左上角在屏幕上的物理像素坐标，用于窗口内相对点击。
@@ -259,4 +303,67 @@ pub fn client_origin(hwnd_value: i64) -> Result<(i32, i32)> {
         ClientToScreen(hwnd, &mut point).ok()?;
         Ok((point.x, point.y))
     }
+}
+
+struct PopupState {
+    target: HWND,
+    pid: u32,
+    foreground: HWND,
+    out: Vec<HWND>,
+}
+
+unsafe extern "system" fn popup_proc(hwnd: HWND, lparam: LPARAM) -> BOOL {
+    let state = &mut *(lparam.0 as *mut PopupState);
+    if hwnd == state.target || !IsWindowVisible(hwnd).as_bool() || is_cloaked(hwnd) {
+        return TRUE;
+    }
+    let owner = GetWindow(hwnd, GW_OWNER).unwrap_or_default();
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let class = class_name(hwnd);
+    let looks_like_popup = class == "#32768" || class.to_lowercase().contains("popup");
+    let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+    let is_tool_window = ex_style & WS_EX_TOOLWINDOW.0 != 0;
+    let owned = owner == state.target;
+    // 自己拥有的窗口一定算；同进程的 Popup 类窗口是 WinUI / WPF 的浮层宿主
+    // （例如 Microsoft.UI.Content.PopupWindowSiteBridge），它们不一定带 WS_POPUP 样式
+    if owned || (pid == state.pid && looks_like_popup && !is_tool_window) {
+        state.out.push(hwnd);
+    }
+    TRUE
+}
+
+/// 目标窗口当前的弹出层：被它拥有的窗口、最近激活的弹出窗口，以及同进程的 Popup 类浮层。
+///
+/// 菜单、下拉框、对话框常常不是主窗口的子控件，而是独立的顶层窗口，
+/// 只在主窗口上 observe 是看不到它们的。
+pub fn related_popups(hwnd_value: i64) -> Vec<WindowInfo> {
+    let Ok(target) = to_hwnd(hwnd_value) else {
+        return Vec::new();
+    };
+    let mut state = PopupState {
+        target,
+        pid: 0,
+        foreground: unsafe { GetForegroundWindow() },
+        out: Vec::new(),
+    };
+    unsafe {
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(target, Some(&mut pid));
+        state.pid = pid;
+        let _ = EnumWindows(Some(popup_proc), LPARAM(&mut state as *mut _ as isize));
+        let last = GetLastActivePopup(target);
+        if !last.0.is_null()
+            && last != target
+            && !state.out.contains(&last)
+            && IsWindowVisible(last).as_bool()
+        {
+            state.out.push(last);
+        }
+    }
+    state
+        .out
+        .iter()
+        .filter_map(|hwnd| unsafe { describe(*hwnd, state.foreground) })
+        .collect()
 }

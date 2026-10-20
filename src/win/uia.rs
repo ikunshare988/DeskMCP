@@ -13,11 +13,12 @@ use windows::Win32::UI::Accessibility::{
     CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationCacheRequest, IUIAutomationElement,
     IUIAutomationExpandCollapsePattern, IUIAutomationInvokePattern,
     IUIAutomationLegacyIAccessiblePattern, IUIAutomationSelectionItemPattern,
-    IUIAutomationTogglePattern, IUIAutomationValuePattern, TreeScope_Subtree,
-    UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId,
-    UIA_ControlTypePropertyId, UIA_ExpandCollapsePatternId, UIA_InvokePatternId,
-    UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId, UIA_LegacyIAccessiblePatternId,
-    UIA_NamePropertyId, UIA_SelectionItemPatternId, UIA_TogglePatternId, UIA_ValuePatternId,
+    IUIAutomationTogglePattern, IUIAutomationTextPattern, IUIAutomationValuePattern,
+    TreeScope_Subtree, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
+    UIA_ClassNamePropertyId, UIA_ControlTypePropertyId, UIA_ExpandCollapsePatternId,
+    UIA_InvokePatternId, UIA_IsEnabledPropertyId, UIA_IsOffscreenPropertyId,
+    UIA_LegacyIAccessiblePatternId, UIA_NamePropertyId, UIA_SelectionItemPatternId,
+    UIA_TextPatternId, UIA_TogglePatternId, UIA_ValuePatternId,
 };
 
 use super::{sleep_ms, to_hwnd};
@@ -25,7 +26,7 @@ use super::{sleep_ms, to_hwnd};
 thread_local! {
     static AUTOMATION: RefCell<Option<IUIAutomation>> = const { RefCell::new(None) };
     // 元素句柄按 id 缓存，模型可以跨多次调用引用同一个控件，不必每次重新观察
-    static CACHE: RefCell<HashMap<String, (i64, IUIAutomationElement)>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<HashMap<String, (i64, IUIAutomationElement, i32)>> = RefCell::new(HashMap::new());
 }
 
 fn automation() -> Result<IUIAutomation> {
@@ -204,11 +205,32 @@ pub fn probe_report(hwnd: i64) {
     for line in render(&nodes).lines().take(30) {
         let _ = writeln!(out, "{line}");
     }
+
+    let popups = super::window::related_popups(hwnd);
+    let _ = writeln!(out, "related_popups: {}", popups.len());
+    for popup in &popups {
+        let _ = writeln!(
+            out,
+            "  hwnd={} class={} title={:?} rect={}x{} visible={}",
+            popup.hwnd, popup.class, popup.title, popup.rect.width, popup.rect.height, popup.visible
+        );
+        match observe_with_walker(popup.hwnd, 8, 60, true) {
+            Ok(nodes) => {
+                let _ = writeln!(out, "  → {} 个控件", nodes.len());
+                for line in render(&nodes).lines().take(12) {
+                    let _ = writeln!(out, "    {line}");
+                }
+            }
+            Err(error) => {
+                let _ = writeln!(out, "  → 读取失败: {error}");
+            }
+        }
+    }
 }
 
 struct WalkState<'a> {
     out: &'a mut Vec<Node>,
-    cache: &'a mut Vec<(String, IUIAutomationElement)>,
+    cache: &'a mut Vec<(String, IUIAutomationElement, i32)>,
     used: HashMap<String, u32>,
     emitted: usize,
     visited: usize,
@@ -296,7 +318,7 @@ unsafe fn walk(
             rect,
             enabled,
         });
-        state.cache.push((id, element.clone()));
+        state.cache.push((id, element.clone(), control_type));
         state.emitted += 1;
     }
 
@@ -312,14 +334,30 @@ unsafe fn walk(
     }
 }
 
-/// 遍历窗口的控件树。返回压缩后的节点列表，并把控件句柄缓存起来。
+/// 遍历单个窗口的控件树，返回压缩后的节点列表，并把控件句柄缓存起来。
 ///
 /// 三条护栏防止被卡死的窗口拖住：缓存请求（一次 IPC 取全部属性）、
 /// 访问节点上限、2.5 秒墙钟上限。
-pub fn observe(hwnd: i64, max_depth: u32, max_elements: usize) -> Result<Vec<Node>> {
+pub fn observe_window(hwnd: i64, max_depth: u32, max_elements: usize) -> Result<Vec<Node>> {
+    observe_with_walker(hwnd, max_depth, max_elements, false)
+}
+
+/// raw=true 用 RawViewWalker：WinUI 的弹出菜单只出现在原始视图里，控件视图会过滤掉。
+fn observe_with_walker(
+    hwnd: i64,
+    max_depth: u32,
+    max_elements: usize,
+    raw: bool,
+) -> Result<Vec<Node>> {
     let automation = automation()?;
     let root = element_from_hwnd(hwnd)?;
-    let walker = unsafe { automation.ControlViewWalker()? };
+    let walker = unsafe {
+        if raw {
+            automation.RawViewWalker()?
+        } else {
+            automation.ControlViewWalker()?
+        }
+    };
     let request = unsafe { automation.CreateCacheRequest()? };
     let root = unsafe {
         for property in [
@@ -354,12 +392,55 @@ pub fn observe(hwnd: i64, max_depth: u32, max_elements: usize) -> Result<Vec<Nod
     CACHE.with(|slot| {
         let mut map = slot.borrow_mut();
         // 同一窗口的旧句柄先清掉，避免 id 指向已经消失的控件
-        map.retain(|_, (cached_hwnd, _)| *cached_hwnd != hwnd);
-        for (id, element) in cache {
-            map.insert(id, (hwnd, element));
+        map.retain(|_, (cached_hwnd, _, _)| *cached_hwnd != hwnd);
+        for (id, element, control_type) in cache {
+            map.insert(id, (hwnd, element, control_type));
         }
     });
     Ok(out)
+}
+
+/// 观察主窗口，并把它的弹出层（菜单、下拉框、对话框）一起合并进来。
+///
+/// 这些浮层通常是独立顶层窗口，只读主窗口会漏掉它们；合并后模型仍然用一个
+/// `observe` 就能看到当前所有可点的东西。
+pub fn observe(
+    hwnd: i64,
+    max_depth: u32,
+    max_elements: usize,
+    include_popups: bool,
+) -> Result<Vec<Node>> {
+    let mut all = observe_window(hwnd, max_depth, max_elements)?;
+    if !include_popups {
+        return Ok(all);
+    }
+    for popup in super::window::related_popups(hwnd) {
+        if all.len() >= max_elements {
+            break;
+        }
+        let remaining = max_elements - all.len();
+        let mut sub = match observe_with_walker(
+            popup.hwnd,
+            max_depth.saturating_sub(1).max(1),
+            remaining,
+            true,
+        ) {
+            Ok(nodes) => nodes,
+            Err(_) => continue,
+        };
+        if sub.is_empty() {
+            continue;
+        }
+        // 标成 Popup 并缩进一层，让模型看出这是主窗口之外的浮层
+        if let Some(root) = sub.first_mut() {
+            root.control_type = "Popup";
+        }
+        for node in sub.iter_mut() {
+            node.depth += 1;
+        }
+        all.extend(sub);
+    }
+    Ok(all)
 }
 
 pub fn render(nodes: &[Node]) -> String {
@@ -389,20 +470,20 @@ pub fn render(nodes: &[Node]) -> String {
     text
 }
 
-fn lookup(id: &str) -> Result<(i64, IUIAutomationElement)> {
+fn lookup(id: &str) -> Result<(i64, IUIAutomationElement, i32)> {
     CACHE
         .with(|slot| slot.borrow().get(id).cloned())
         .ok_or_else(|| anyhow!("找不到控件 {id}：先调用 observe 重新获取，或该控件已消失"))
 }
 
 pub fn rect_of(id: &str) -> Result<(i64, RECT)> {
-    let (hwnd, element) = lookup(id)?;
+    let (hwnd, element, _) = lookup(id)?;
     let rect = unsafe { element.CurrentBoundingRectangle()? };
     Ok((hwnd, rect))
 }
 
 pub fn focus_element(id: &str) -> Result<()> {
-    let (_, element) = lookup(id)?;
+    let (_, element, _) = lookup(id)?;
     unsafe {
         element.SetFocus()?;
     }
@@ -411,47 +492,55 @@ pub fn focus_element(id: &str) -> Result<()> {
 
 /// 优先用控件自身暴露的动作（Invoke / Toggle / Select / Expand / 默认动作），
 /// 都不支持时才退回坐标点击。模型只需要说“点它”，不用关心走哪条路。
+///
+/// 菜单栏项（MenuItem / SplitButton）例外：它们的 Invoke 和 Expand 都会返回成功
+/// 但界面毫无变化，所以这一类直接走真实点击。
 pub fn activate(id: &str) -> Result<&'static str> {
-    let (_, element) = lookup(id)?;
-    unsafe {
-        if let Ok(pattern) = element
-            .GetCurrentPattern(UIA_InvokePatternId)
-            .and_then(|unknown| Ok(unknown.cast::<IUIAutomationInvokePattern>()?))
-        {
-            if pattern.Invoke().is_ok() {
-                return Ok("invoke");
+    let (_, element, control_type) = lookup(id)?;
+    // 菜单项直接真实点击：WinUI 的菜单栏项对 Invoke / Expand 都返回成功，
+    // 但界面不会变化，只有真的点一下才会展开
+    let prefers_real_click = matches!(control_type, 50011 | 50031);
+    if !prefers_real_click {
+        unsafe {
+            if let Ok(pattern) = element
+                .GetCurrentPattern(UIA_InvokePatternId)
+                .and_then(|unknown| Ok(unknown.cast::<IUIAutomationInvokePattern>()?))
+            {
+                if pattern.Invoke().is_ok() {
+                    return Ok("invoke");
+                }
             }
-        }
-        if let Ok(pattern) = element
-            .GetCurrentPattern(UIA_TogglePatternId)
-            .and_then(|unknown| Ok(unknown.cast::<IUIAutomationTogglePattern>()?))
-        {
-            if pattern.Toggle().is_ok() {
-                return Ok("toggle");
+            if let Ok(pattern) = element
+                .GetCurrentPattern(UIA_TogglePatternId)
+                .and_then(|unknown| Ok(unknown.cast::<IUIAutomationTogglePattern>()?))
+            {
+                if pattern.Toggle().is_ok() {
+                    return Ok("toggle");
+                }
             }
-        }
-        if let Ok(pattern) = element
-            .GetCurrentPattern(UIA_SelectionItemPatternId)
-            .and_then(|unknown| Ok(unknown.cast::<IUIAutomationSelectionItemPattern>()?))
-        {
-            if pattern.Select().is_ok() {
-                return Ok("select");
+            if let Ok(pattern) = element
+                .GetCurrentPattern(UIA_SelectionItemPatternId)
+                .and_then(|unknown| Ok(unknown.cast::<IUIAutomationSelectionItemPattern>()?))
+            {
+                if pattern.Select().is_ok() {
+                    return Ok("select");
+                }
             }
-        }
-        if let Ok(pattern) = element
-            .GetCurrentPattern(UIA_ExpandCollapsePatternId)
-            .and_then(|unknown| Ok(unknown.cast::<IUIAutomationExpandCollapsePattern>()?))
-        {
-            if pattern.Expand().is_ok() {
-                return Ok("expand");
+            if let Ok(pattern) = element
+                .GetCurrentPattern(UIA_ExpandCollapsePatternId)
+                .and_then(|unknown| Ok(unknown.cast::<IUIAutomationExpandCollapsePattern>()?))
+            {
+                if pattern.Expand().is_ok() {
+                    return Ok("expand");
+                }
             }
-        }
-        if let Ok(pattern) = element
-            .GetCurrentPattern(UIA_LegacyIAccessiblePatternId)
-            .and_then(|unknown| Ok(unknown.cast::<IUIAutomationLegacyIAccessiblePattern>()?))
-        {
-            if pattern.DoDefaultAction().is_ok() {
-                return Ok("default-action");
+            if let Ok(pattern) = element
+                .GetCurrentPattern(UIA_LegacyIAccessiblePatternId)
+                .and_then(|unknown| Ok(unknown.cast::<IUIAutomationLegacyIAccessiblePattern>()?))
+            {
+                if pattern.DoDefaultAction().is_ok() {
+                    return Ok("default-action");
+                }
             }
         }
     }
@@ -467,48 +556,94 @@ pub fn activate(id: &str) -> Result<&'static str> {
     Ok("click-center")
 }
 
+/// 回读控件内容，确认写入是否真的生效。
+///
+/// 只看 ValuePattern 不够：WinUI 的文档控件会记住 SetValue 传进去的值，
+/// 但界面和文件都没变。所以再读一次 TextPattern 的正文做交叉验证。
+unsafe fn content_matches(element: &IUIAutomationElement, text: &str) -> bool {
+    // 文档正文以 TextPattern 为准：ValuePattern 在 WinUI 的文档控件上会撒谎，
+    // 它记得 SetValue 传进去的值，但界面和文件都没变
+    if let Ok(pattern) = element
+        .GetCurrentPattern(UIA_TextPatternId)
+        .and_then(|unknown| Ok(unknown.cast::<IUIAutomationTextPattern>()?))
+    {
+        if let Ok(range) = pattern.DocumentRange() {
+            if let Ok(body) = range.GetText(-1) {
+                return body.to_string().contains(text);
+            }
+        }
+    }
+    if let Ok(pattern) = element
+        .GetCurrentPattern(UIA_ValuePatternId)
+        .and_then(|unknown| Ok(unknown.cast::<IUIAutomationValuePattern>()?))
+    {
+        return pattern
+            .CurrentValue()
+            .map(|value| value.to_string() == text)
+            .unwrap_or(false);
+    }
+    false
+}
+
 /// 直接把值写进控件。没有 ValuePattern 时退回“聚焦 + 全选 + 输入”。
 ///
 /// 不少控件（记事本的正文区、部分 RichEdit）会接受 SetValue 却不真的改内容，
 /// 所以写完要回读一次，对不上就走输入通道，不让调用方去试第二次。
-pub fn set_value(id: &str, text: &str) -> Result<(&'static str, bool)> {
-    let (_, element) = lookup(id)?;
-    unsafe {
-        if let Ok(pattern) = element
-            .GetCurrentPattern(UIA_ValuePatternId)
-            .and_then(|unknown| Ok(unknown.cast::<IUIAutomationValuePattern>()?))
-        {
-            let read_only = pattern
-                .CurrentIsReadOnly()
-                .map(|value| value.as_bool())
-                .unwrap_or(false);
-            if !read_only && pattern.SetValue(&BSTR::from(text)).is_ok() {
-                let applied = pattern
-                    .CurrentValue()
-                    .map(|value| value.to_string() == text)
-                    // 读不回来就认为写入失败，宁可多打一遍键盘
+pub fn set_value(id: &str, text: &str) -> Result<(&'static str, Option<bool>)> {
+    let (hwnd, element, control_type) = lookup(id)?;
+    // 文档类控件（记事本正文、Word 编辑区）一律走键盘：它们的 ValuePattern
+    // 会接受 SetValue 并把值记在属性里，但正文和文件都不会变，无法可靠校验
+    let is_document = control_type == 50030;
+    if !is_document {
+        unsafe {
+            if let Ok(pattern) = element
+                .GetCurrentPattern(UIA_ValuePatternId)
+                .and_then(|unknown| Ok(unknown.cast::<IUIAutomationValuePattern>()?))
+            {
+                let read_only = pattern
+                    .CurrentIsReadOnly()
+                    .map(|value| value.as_bool())
                     .unwrap_or(false);
-                if applied {
-                    return Ok(("value-pattern", true));
+                if !read_only
+                    && pattern.SetValue(&BSTR::from(text)).is_ok()
+                    && content_matches(&element, text)
+                {
+                    return Ok(("value-pattern", Some(true)));
                 }
             }
         }
     }
-    focus_element(id)?;
-    sleep_ms(60);
+    // 键盘通道要求目标窗口在前台。SetForegroundWindow 经常被系统拒绝，
+    // 所以在控件上真点一下：真实点击一定会把焦点带过去
+    let rect = unsafe { element.CurrentBoundingRectangle().unwrap_or_default() };
+    super::window::focus(hwnd)?;
+    sleep_ms(80);
+    if rect.right > rect.left && rect.bottom > rect.top {
+        let x = (rect.left + rect.right) / 2;
+        let y = (rect.top + rect.bottom) / 2;
+        super::input::click(x, y, "left", 1)?;
+        sleep_ms(80);
+    } else {
+        focus_element(id)?;
+        sleep_ms(60);
+    }
     super::input::press_keys("ctrl+a")?;
-    crate::win::sleep_ms(30);
+    sleep_ms(30);
     super::input::type_text(text)?;
-    // 输入通道写完也回读一次，让调用方知道到底成没成
+    if !super::window::is_foreground(hwnd) {
+        // 常见于窗口在别的虚拟桌面、或被系统前台锁挡住
+        return Err(anyhow!(
+            "键盘输入没能送达：目标窗口不在前台。请先把它切到当前桌面并激活，或改用 click + type_text"
+        ));
+    }
     let verified = unsafe {
-        lookup(id).ok().and_then(|(_, element)| {
-            element
-                .GetCurrentPattern(UIA_ValuePatternId)
-                .ok()
-                .and_then(|unknown| unknown.cast::<IUIAutomationValuePattern>().ok())
-                .and_then(|pattern| pattern.CurrentValue().ok())
-                .map(|value| value.to_string() == text)
-        })
+        lookup(id)
+            .ok()
+            .map(|(_, element, _)| content_matches(&element, text))
+            .unwrap_or(true)
     };
-    Ok(("focus+type", verified.unwrap_or(true)))
+    // 文档类控件的回读经常滞后或不准（刚输入完 UIA 还是旧内容），
+    // 这种情况不下结论，让调用方用截图确认
+    let verified = if is_document { None } else { Some(verified) };
+    Ok(("focus+type", verified))
 }
