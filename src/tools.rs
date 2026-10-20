@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
 use serde_json::{json, Value};
 
-use crate::win::{capture, clipboard, input, window};
+use crate::win::{capture, clipboard, input, uia, window};
 
 fn text_result(text: impl Into<String>) -> Value {
     json!({ "content": [ { "type": "text", "text": text.into() } ] })
@@ -74,6 +74,83 @@ pub fn definitions() -> Value {
                         "description": "可选。图片最大宽度，默认 1280，用于控制上下文体积。传 0 表示不缩放。"
                     }
                 },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "observe",
+            "description": "读取窗口的控件树（UI Automation），每个控件带一个稳定 id，例如 `e3a1 Button \"保存\" aid=btnSave @120,340,80x26`。拿到 id 后直接用 click_element / set_value 操作，不需要截图也不需要坐标。一次 observe 的结果可以支撑后续多步操作，不要每步都重新观察。不可见的控件不会出现。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "hwnd": { "type": "integer", "description": "目标窗口。" },
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "最大层数，默认 12。窗口特别复杂时可以调到 6 只看上层。"
+                    },
+                    "max_elements": {
+                        "type": "integer",
+                        "description": "最多返回多少个控件，默认 400。"
+                    }
+                },
+                "required": ["hwnd"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "click_element",
+            "description": "按 observe 返回的 id 触发控件。内部会依次尝试 Invoke / Toggle / Select / Expand / 默认动作，都不支持时才点控件中心。调用方不需要知道控件类型，也不需要坐标。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "observe 返回的控件 id，如 e3a1。" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "set_value",
+            "description": "按 id 把文本写进输入框/下拉框。控件支持 ValuePattern 时直接赋值；否则聚焦后全选替换。比「点击 + 全选 + 输入」省两次调用。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["id", "text"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "act",
+            "description": "一次调用按顺序执行多个步骤，任一步失败即停止（stop_on_error=false 可继续）。这是最省往返的用法：把点击、填值、快捷键、等待、截图合成一次调用。步骤对象用 do 字段区分：click_element{id} / set_value{id,text} / click{x,y,hwnd?} / type_text{text} / press_keys{keys} / scroll{x,y,amount} / wait{ms} / wait_for{name,timeout_ms} / focus_window{hwnd}。默认结束时附带一张截图，用于确认结果。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "hwnd": {
+                        "type": "integer",
+                        "description": "可选。作为步骤里未指定 hwnd 时的默认值，也用于最后的截图。"
+                    },
+                    "steps": {
+                        "type": "array",
+                        "description": "按顺序执行的步骤。",
+                        "items": { "type": "object" }
+                    },
+                    "stop_on_error": {
+                        "type": "boolean",
+                        "description": "失败是否立即停止，默认 true。"
+                    },
+                    "screenshot_at_end": {
+                        "type": "boolean",
+                        "description": "结束时是否截图，默认 true。"
+                    },
+                    "max_width": {
+                        "type": "integer",
+                        "description": "结尾截图的最大宽度，默认 1280。"
+                    }
+                },
+                "required": ["steps"],
                 "additionalProperties": false
             }
         },
@@ -262,6 +339,158 @@ fn screenshot(args: &Value) -> Result<Value> {
     }))
 }
 
+fn step_point(step: &Value) -> Result<(i32, i32)> {
+    let x = int_arg(step, "x")? as i32;
+    let y = int_arg(step, "y")? as i32;
+    match opt_int(step, "hwnd") {
+        Some(hwnd) => {
+            let (ox, oy) = window::client_origin(hwnd)?;
+            Ok((ox + x, oy + y))
+        }
+        None => Ok((x, y)),
+    }
+}
+
+fn wait_for(hwnd: i64, name: &str, timeout_ms: u64) -> Result<String> {
+    let needle = name.to_lowercase();
+    let started = std::time::Instant::now();
+    loop {
+        if let Ok(nodes) = uia::observe(hwnd, 12, 600) {
+            let hit = nodes.iter().any(|node| {
+                node.name.to_lowercase().contains(&needle)
+                    || node.automation_id.to_lowercase().contains(&needle)
+            });
+            if hit {
+                return Ok(format!("命中 \"{name}\"（{}ms）", started.elapsed().as_millis()));
+            }
+        }
+        if started.elapsed().as_millis() as u64 >= timeout_ms {
+            return Err(anyhow!("等待 \"{name}\" 超时（{timeout_ms}ms）"));
+        }
+        crate::win::sleep_ms(200);
+    }
+}
+
+fn run_step(step: &Value, default_hwnd: Option<i64>) -> Result<String> {
+    let action = step
+        .get("do")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| anyhow!("步骤缺少 do 字段"))?;
+    match action {
+        "click_element" => {
+            let id = str_arg(step, "id")?;
+            Ok(uia::activate(id)?.to_string())
+        }
+        "set_value" => {
+            let id = str_arg(step, "id")?;
+            let text = str_arg(step, "text")?;
+            let (how, verified) = uia::set_value(id, text)?;
+            Ok(if verified {
+                format!("{how}，已回读确认")
+            } else {
+                format!("{how}，回读内容不一致")
+            })
+        }
+        "click" => {
+            let (x, y) = step_point(step)?;
+            let button = step.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+            let count = opt_int(step, "count").unwrap_or(1).max(1) as u32;
+            input::click(x, y, button, count)?;
+            Ok(format!("({x}, {y}) {button} ×{count}"))
+        }
+        "type_text" => {
+            let text = str_arg(step, "text")?;
+            input::type_text(text)?;
+            Ok(format!("输入 {} 个字符", text.chars().count()))
+        }
+        "press_keys" => {
+            let keys = str_arg(step, "keys")?;
+            input::press_keys(keys)?;
+            Ok(keys.to_string())
+        }
+        "scroll" => {
+            let (x, y) = step_point(step)?;
+            let amount = opt_int(step, "amount").unwrap_or(3) as i32;
+            input::scroll(x, y, amount)?;
+            Ok(format!("滚动 {amount} 格"))
+        }
+        "wait" => {
+            let ms = opt_int(step, "ms").unwrap_or(300).clamp(0, 30_000) as u64;
+            crate::win::sleep_ms(ms);
+            Ok(format!("等待 {ms}ms"))
+        }
+        "wait_for" => {
+            let name = str_arg(step, "name")?;
+            let hwnd = opt_int(step, "hwnd")
+                .or(default_hwnd)
+                .ok_or_else(|| anyhow!("wait_for 需要 hwnd"))?;
+            let timeout = opt_int(step, "timeout_ms").unwrap_or(5000).clamp(100, 60_000) as u64;
+            wait_for(hwnd, name, timeout)
+        }
+        "focus_window" => {
+            let hwnd = int_arg(step, "hwnd")?;
+            let info = window::focus(hwnd)?;
+            Ok(format!("\"{}\"", info.title))
+        }
+        other => Err(anyhow!("不支持的步骤 {other}")),
+    }
+}
+
+fn act(args: &Value) -> Result<Value> {
+    let steps = args
+        .get("steps")
+        .and_then(|value| value.as_array())
+        .cloned()
+        .ok_or_else(|| anyhow!("steps 必须是数组"))?;
+    let default_hwnd = opt_int(args, "hwnd");
+    let stop_on_error = args
+        .get("stop_on_error")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+
+    let mut log = String::new();
+    let mut failed = false;
+    for (index, step) in steps.iter().enumerate() {
+        let label = step.get("do").and_then(|value| value.as_str()).unwrap_or("?");
+        match run_step(step, default_hwnd) {
+            Ok(note) => log.push_str(&format!("{}. {label} → {note}\n", index + 1)),
+            Err(error) => {
+                log.push_str(&format!("{}. {label} → 失败：{error:#}\n", index + 1));
+                failed = true;
+                if stop_on_error {
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut value = json!({
+        "content": [ { "type": "text", "text": log.trim_end().to_string() } ]
+    });
+    let want_shot = args
+        .get("screenshot_at_end")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    if want_shot {
+        let mut shot = json!({ "max_width": opt_int(args, "max_width").unwrap_or(1280) });
+        if let Some(hwnd) = default_hwnd {
+            shot["hwnd"] = json!(hwnd);
+        }
+        if let Ok(result) = screenshot(&shot) {
+            if let (Some(items), Some(target)) = (
+                result.get("content").and_then(|v| v.as_array()),
+                value.get_mut("content").and_then(|v| v.as_array_mut()),
+            ) {
+                target.extend(items.iter().cloned());
+            }
+        }
+    }
+    if failed {
+        value["isError"] = json!(true);
+    }
+    Ok(value)
+}
+
 pub fn call(params: &Value) -> std::result::Result<Value, (i64, String)> {
     let name = params
         .get("name")
@@ -295,6 +524,37 @@ pub fn call(params: &Value) -> std::result::Result<Value, (i64, String)> {
                     .unwrap_or_default(),
                 )
             }
+            "observe" => {
+                let hwnd = int_arg(&args, "hwnd")?;
+                let depth = opt_int(&args, "max_depth").unwrap_or(12).clamp(1, 32) as u32;
+                let max_elements = opt_int(&args, "max_elements").unwrap_or(400).clamp(1, 3000) as usize;
+                let nodes = uia::observe(hwnd, depth, max_elements)?;
+                let info = window::get(hwnd)?;
+                text_result(format!(
+                    "窗口 \"{}\" hwnd={} 控件 {} 个\n{}",
+                    info.title,
+                    info.hwnd,
+                    nodes.len(),
+                    uia::render(&nodes)
+                ))
+            }
+            "click_element" => {
+                let id = str_arg(&args, "id")?;
+                let how = uia::activate(id)?;
+                text_result(format!("{id} → {how}"))
+            }
+            "set_value" => {
+                let id = str_arg(&args, "id")?;
+                let text = str_arg(&args, "text")?;
+                let (how, verified) = uia::set_value(id, text)?;
+                let count = text.chars().count();
+                text_result(if verified {
+                    format!("{id} → {how}（{count} 个字符，已回读确认）")
+                } else {
+                    format!("{id} → {how}（{count} 个字符，但回读内容不一致，建议先 observe 确认）")
+                })
+            }
+            "act" => act(&args)?,
             "focus_window" => {
                 let hwnd = int_arg(&args, "hwnd")?;
                 let info = window::focus(hwnd)?;

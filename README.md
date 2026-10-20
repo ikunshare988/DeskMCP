@@ -4,6 +4,8 @@
 
 单文件 exe，无 Python 运行时、无浏览器内核、不下载任何模型。
 
+和同类工具最大的区别：**不靠截图也能操作**。先读窗口的控件树（文字，`observe`），再按控件 id 点击或填值（`click_element` / `set_value`），最后用一个 `act` 调用把整串步骤一次跑完。同一个任务通常只要 2–3 次调用，而不是「截图 → 点 → 截图 → 点」。
+
 ## 快速开始
 
 **1. 下载**
@@ -42,9 +44,9 @@
 
 **4. 试一句**
 
-> 列出当前打开的窗口，找到记事本，在我说的位置输入一段中文，然后截图给我看。
+> 打开记事本，写一段中文，保存，然后截图给我看。
 
-客户端会自己按 `list_windows → focus_window → type_text → screenshot` 的顺序调用。
+客户端会按 `list_windows → observe → act` 走完，全程一张图。
 
 **5. 出问题先自检**
 
@@ -56,12 +58,12 @@
 
 ## 当前状态
 
-这是 MVP。已实现窗口层、输入层、视觉层三件事，语义层（UI Automation）和审计面板还没做。
+这是 MVP。窗口层、语义层、输入层、视觉层都已可用，审计面板和宏模式还没做。
 
 | 层 | 能力 | 状态 |
 | --- | --- | --- |
 | L0 窗口 | 枚举、聚焦、读矩形、抓屏 | 已实现 |
-| L1 语义 | UI Automation 控件树、按控件名定位 | 未实现 |
+| L1 语义 | UI Automation 控件树、按控件 id 定位与触发 | 已实现 |
 | L2 视觉 | 截图 PNG、坐标点击 | 已实现 |
 | L3 注入 | SendInput 鼠标键盘、Unicode 输入 | 已实现 |
 | 宏模式 | 录制 → 编译成原生脚本 | 未实现 |
@@ -82,6 +84,10 @@ cargo build --release
 | --- | --- |
 | `list_windows` | 列出顶层窗口：hwnd、标题、类名、进程名、屏幕矩形 |
 | `get_window` | 单个窗口详情 + 该窗口支持的能力层级 |
+| `observe` | 读控件树，每个控件带稳定 id：`e3a1 Button "保存" aid=btnSave @120,340,80x26` |
+| `click_element` | 按 id 触发控件，内部自动选 Invoke / Toggle / Select / Expand / 默认动作 / 点中心 |
+| `set_value` | 按 id 写文本，写完回读校验，不一致自动改走键盘输入 |
+| `act` | 一次调用顺序执行多步（点击/填值/快捷键/等待/等元素/滚动），默认附带结尾截图 |
 | `focus_window` | 切到前台并解除最小化 |
 | `screenshot` | 截图返回 PNG；传 hwnd 抓该窗口，不传抓全屏 |
 | `click` | 移动并点击；传 hwnd 时坐标相对客户区 |
@@ -94,15 +100,39 @@ cargo build --release
 
 `screenshot` 默认把图缩到 1280 宽，并在返回文本里给出缩放比例——模型换算点击坐标时要用这个值。
 
-### 典型调用流程
+## 为什么调用更少
+
+同一个任务（在记事本里写一句话并保存），两种做法：
+
+| 做法 | 调用序列 | 次数 | 图片 |
+| --- | --- | --- | --- |
+| 纯视觉 | list_windows → focus_window → screenshot → click → type_text → press_keys → screenshot | 7 | 2 张 |
+| 语义 | list_windows → observe → act（聚焦、填值、Ctrl+S 全在里面） | 3 | 1 张 |
+
+已知 hwnd 时只要 2 次。省下来的不只是往返延迟，还有两次整屏图片的 token。
+
+几个具体的省法：
+
+- **`observe` 一次拿到全部控件**，id 在同一窗口内稳定，可以跨调用复用，不必每步重新观察。
+- **`set_value` 内部带回读校验**：有些控件（记事本正文、部分 RichEdit）会接受 `SetValue` 却不真的改内容，这时自动改走「聚焦 + 全选 + 输入」，调用方不用重试。
+- **`click_element` 内部有动作降级链**：按钮走 Invoke，复选框走 Toggle，页签走 Select，菜单走 Expand，都不支持才点坐标。
+- **`wait_for` 把轮询放在服务端**：`act` 里等元素出现，不需要模型反复截图确认。
+
+## 典型调用流程
 
 ```text
-list_windows                  → 找到目标 hwnd
-focus_window {hwnd}           → 切到前台
-screenshot {hwnd}             → 看当前画面
-click {x, y, hwnd}            → 点一下
-screenshot {hwnd}             → 确认结果
+list_windows                     → 找到目标 hwnd
+observe {hwnd}                   → 拿到控件 id
+act {hwnd, steps: [
+  {do:"focus_window", hwnd},
+  {do:"click_element", id:"e3a1"},
+  {do:"set_value", id:"e7", text:"..."},
+  {do:"press_keys", keys:"ctrl+s"},
+  {do:"wait_for", name:"已保存"}
+]}                               → 一次执行完，结尾自动截图
 ```
+
+窗口没有 UI Automation 树时（`get_window` 返回 `capabilities.uia=false`），退回 `screenshot` + `click` 的坐标方式。
 
 ## 实现要点
 
@@ -112,19 +142,25 @@ screenshot {hwnd}             → 确认结果
 - **坐标注入**：`SendInput` 用 `MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK`，按虚拟桌面归一化，多显示器不用额外处理。
 - **中文输入**：`type_text` 不模拟按键，直接发 UTF-16 code unit，不依赖键盘布局，也不动剪贴板。
 - **协议**：stdio 上一行一条 JSON-RPC 2.0，日志全走 stderr。支持协议版本 2024-11-05 / 2025-03-26 / 2025-06-18。
+- **控件树**：用 `IUIAutomationCacheRequest` 一次把 Name / ControlType / AutomationId / ClassName / Rect / IsEnabled / IsOffscreen 全部取回，避免每个控件 7 次跨进程调用。
+- **防止被卡死**：连接超时 800ms、事务超时 2s；单次遍历最多访问 1200 个节点、墙钟 2.5 秒，超了先返回已拿到的部分，不让整个服务器陪着目标应用一起卡住。
+- **控件 id**：由 `hwnd + automationId + name + controlType + className` 哈希得到，窗口移动或列表滚动后 id 不变，模型可以跨调用复用；重名时加 `-2` 后缀。
+- **不可见节点**：`IsOffscreen` 为真的子树整棵跳过，既省 token，也避免模型点到看不见的控件。
 
 ## 已知限制
 
 - 只支持 Windows。
-- 对以管理员权限运行的窗口发送输入会被 UIPI 拒绝，除非 DeskMCP 本身也提权。
+- 对以管理员权限运行的窗口发送输入会被 UIPI 拒绝，UIA 也读不到它们的控件树（返回空），除非 DeskMCP 本身也提权。
 - 最小化的窗口无法截图，需要先 `focus_window`。
 - 独占全屏的应用抓不到画面（这是 DWM 的机制限制，不是实现问题）。
+- 弹出菜单、下拉框、对话框常常是独立的顶层窗口，`observe` 主窗口时看不到；需要 `list_windows` 找到那个新窗口再观察。
+- 目标应用弹着模态对话框时，对它的 UIA 调用可能变慢甚至超时。
 - 不执行 JS、不做 OCR，视觉层目前只有截图，没有「按文字找位置」。
 - 唯一实例模型：多个客户端同时连同一个 exe 会各自启动一个进程，不会共享状态。
 
 ## 路线
 
-1. L1：UI Automation 控件树、按控件名/角色定位（让模型不必依赖坐标）
+1. 弹窗跟随：自动发现目标窗口新弹出的菜单 / 对话框，合并进同一次 `observe`
 2. 审计面板：每次调用的入参、结果、耗时，可视化并支持回放
 3. 宏模式：把一串操作编译成原生脚本，60Hz 确定性执行
 4. 权限模型：默认拒绝点击/输入，按进程白名单授权

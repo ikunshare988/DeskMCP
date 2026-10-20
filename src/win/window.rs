@@ -206,6 +206,7 @@ pub fn get(hwnd_value: i64) -> Result<WindowInfo> {
 pub fn capabilities(hwnd_value: i64) -> Result<Capabilities> {
     let info = get(hwnd_value)?;
     let mut caps = Capabilities::default();
+    caps.uia = super::uia::probe(hwnd_value);
     if info.minimized {
         caps.vision = false;
         caps.notes.push("窗口已最小化，截图会失败；先调用 focus_window 恢复".into());
@@ -214,8 +215,14 @@ pub fn capabilities(hwnd_value: i64) -> Result<Capabilities> {
         caps.vision = false;
         caps.notes.push("窗口尺寸为 0，无法截图".into());
     }
-    caps.notes
-        .push("uia 未实现：当前只能按坐标或快捷键操作，无法按控件名定位".into());
+    if caps.uia {
+        caps.notes
+            .push("支持 observe 按控件名定位，优先用它，不要靠坐标".into());
+    } else {
+        caps.notes.push(
+            "该窗口没有 UI Automation 树（常见于游戏、canvas 应用），只能用截图 + 坐标".into(),
+        );
+    }
     Ok(caps)
 }
 

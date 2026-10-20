@@ -8,14 +8,21 @@ const SUPPORTED_VERSIONS: [&str; 3] = ["2024-11-05", "2025-03-26", "2025-06-18"]
 const LATEST_VERSION: &str = "2025-06-18";
 
 const INSTRUCTIONS: &str = "\
-DeskMCP 把 Windows 桌面能力暴露为工具。推荐的操作顺序：
+DeskMCP 把 Windows 桌面能力暴露为工具。优先走语义路径，最后才用像素路径。
+
+标准应用通常只需要 2 次调用：
 1. list_windows 找到目标窗口的 hwnd；
-2. focus_window 把它切到前台；
-3. screenshot（带 hwnd）看当前画面；
-4. click / type_text / press_keys 执行操作，每一步之后再截图确认结果。
-坐标默认是屏幕物理像素；click / scroll 传入 hwnd 时，坐标相对该窗口客户区左上角。
+2. observe {hwnd} 读取控件树，每个控件带一个 id，例如 `e3a1 Button \"保存\" aid=btnSave @120,340,80x26`；
+3. act {hwnd, steps:[{do:\"click_element\",id:\"e3a1\"},{do:\"set_value\",id:\"e7\",text:\"...\"},{do:\"wait_for\",name:\"完成\"}]}
+   一次调用把整串操作执行完，结束时自动附带截图。
+
+observe 的 id 在同一窗口内是稳定的，可以跨多次调用复用；界面大改之后再重新 observe。
+click_element / set_value 内部会自动选择合适的 UI Automation 动作，不需要坐标，也不需要知道控件类型。
+
+只有 capabilities.uia=false 的窗口（游戏、canvas、自绘界面）才退回 screenshot + click 的坐标方式。
+坐标是屏幕物理像素；click / scroll 传 hwnd 时相对该窗口客户区左上角。
 screenshot 返回的图片可能被缩小，返回文本里给出了缩放比例，换算坐标时要用。
-对已最小化的窗口先 focus_window，否则截图会失败。
+最小化的窗口先 focus_window，否则截图会失败。
 输入事件对以管理员权限运行的窗口无效（UIPI 限制）。";
 
 fn error_response(id: Value, code: i64, message: &str) -> String {

@@ -88,8 +88,10 @@ fn main() {
         println!("deskmcp {} — Windows 桌面能力 MCP 服务器", env!("CARGO_PKG_VERSION"));
         println!("用法:");
         println!("  deskmcp                     以 stdio 方式运行（给 MCP 客户端用）");
+        println!("  deskmcp --print-config      打印客户端配置片段");
         println!("  deskmcp --self-test         本机自检，打印窗口/截图/协议结果");
         println!("  deskmcp --self-test --shot <path>  自检并保存一张全屏截图");
+        println!("  deskmcp --probe <hwnd>      分阶段打印 UI Automation 调用耗时");
         println!("  deskmcp --version");
         return;
     }
@@ -103,6 +105,18 @@ fn main() {
         println!(
             "{{\n  \"mcpServers\": {{\n    \"deskmcp\": {{\n      \"command\": \"{exe}\",\n      \"args\": []\n    }}\n  }}\n}}"
         );
+        return;
+    }
+    if let Some(index) = args.iter().position(|a| a == "--probe") {
+        let hwnd: i64 = args
+            .get(index + 1)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        if hwnd == 0 {
+            println!("用法: deskmcp --probe <hwnd>");
+            return;
+        }
+        win::uia::probe_report(hwnd);
         return;
     }
     if args.iter().any(|a| a == "--self-test") {
