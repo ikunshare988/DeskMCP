@@ -4,6 +4,56 @@
 
 单文件 exe，无 Python 运行时、无浏览器内核、不下载任何模型。
 
+## 快速开始
+
+**1. 下载**
+
+从 [Releases](https://github.com/ikunshare988/DeskMCP/releases) 下载 `deskmcp.exe`，放到任意目录。exe 未做代码签名，Windows 首次运行可能提示「已保护你的电脑」，点「更多信息 → 仍要运行」即可。每个 Release 都附 `SHA256.txt`，可以自行核对。
+
+**2. 生成配置**
+
+```powershell
+.\deskmcp.exe --print-config
+```
+
+**3. 贴进客户端**
+
+把输出合并进客户端的 `mcpServers`：
+
+```json
+{
+  "mcpServers": {
+    "deskmcp": {
+      "command": "D:\\DeskMCP\\deskmcp.exe",
+      "args": []
+    }
+  }
+}
+```
+
+配置文件位置：
+
+- Claude Desktop：`%APPDATA%\Claude\claude_desktop_config.json`
+- Cursor：`%USERPROFILE%\.cursor\mcp.json`
+- Cline / Roo Code：扩展设置里的 MCP Servers
+- Trae：设置 → MCP → 添加
+
+改完重启客户端。stdio 传输不需要端口，也不会弹窗。
+
+**4. 试一句**
+
+> 列出当前打开的窗口，找到记事本，在我说的位置输入一段中文，然后截图给我看。
+
+客户端会自己按 `list_windows → focus_window → type_text → screenshot` 的顺序调用。
+
+**5. 出问题先自检**
+
+```powershell
+.\deskmcp.exe --self-test
+```
+
+会打印窗口数量、截图尺寸、输入通道是否可用、协议是否能正常应答。截图失败时用 `--self-test --shot out.png` 看一眼实际画面。
+
 ## 当前状态
 
 这是 MVP。已实现窗口层、输入层、视觉层三件事，语义层（UI Automation）和审计面板还没做。
@@ -25,40 +75,6 @@ cargo build --release
 ```
 
 产物是 `target\release\deskmcp.exe`，可以直接拷走。
-
-自检（不接客户端也能跑）：
-
-```powershell
-.\deskmcp.exe --self-test
-.\deskmcp.exe --self-test --shot out.png   # 顺便存一张全屏截图
-```
-
-## 接入客户端
-
-```powershell
-.\deskmcp.exe --print-config
-```
-
-会打印一段带绝对路径的配置。把它合并进客户端的 `mcpServers`：
-
-```json
-{
-  "mcpServers": {
-    "deskmcp": {
-      "command": "D:\\DeskMCP\\target\\release\\deskmcp.exe",
-      "args": []
-    }
-  }
-}
-```
-
-配置文件位置：
-
-- Claude Desktop：`%APPDATA%\Claude\claude_desktop_config.json`
-- Cursor：`%USERPROFILE%\.cursor\mcp.json`
-- Cline / Roo Code：扩展设置里的 MCP Servers
-
-改完重启客户端。stdio 传输不需要端口，也不会弹窗。
 
 ## 工具
 

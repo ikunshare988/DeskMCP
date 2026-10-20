@@ -1,6 +1,6 @@
 [package]
 name = "deskmcp"
-version = "0.1.0"
+version = "0.10.0"
 edition = "2021"
 description = "Windows desktop capability bridge exposed as an MCP server"
 license = "MIT"
