@@ -63,14 +63,38 @@
 | 层 | 能力 | 状态 |
 | --- | --- | --- |
 | L0 窗口 | 枚举、聚焦、读矩形、抓屏 | 已实现 |
-| L1 语义 | UI Automation 控件树、按控件 id 定位与触发、**id 使用前身份校验** | 已实现 |
+| L1 语义 | UI Automation 控件树、按控件 id 定位与触发、**id 使用前身份校验**、**按条件查找（find）**、**状态读取（read）**、**动作矩阵（invoke，16 个动作）** | 已实现 |
 | L2 视觉 | 截图 PNG、坐标点击 | 已实现 |
 | L3 注入 | SendInput 鼠标键盘、Unicode 输入 | 已实现 |
 | 宏模式 | 录制 → 编译成原生脚本 | 未实现 |
 
-当前版本 **v0.20.1**。
+当前版本 **v0.21.0**。
 
 ## 更新日志
+
+### v0.21.0
+
+工具从 15 个增加到 18 个。这一版的目标是「**少截屏**」：能用语义读到的就不截图，能用一次调用做完的就不来回。
+
+新增：
+
+- **`find`**：按名称 / AutomationId / 控件类型 / 类名 / 可用状态查找控件，**只返回命中的那些**，支持 `within` 限定子树。不必再把整棵树读回来自己找，也不受 `observe`「一次最多 400 个元素」的限制。
+- **`read`**：一次读多个控件的值 / 开关 / 选中 / 展开 / 范围 / 可用 / 可见 / 焦点 / 矩形，用来确认上一步到底生效没有——比再截一张整屏图便宜三个数量级，也不需要换算坐标。
+- **`invoke`**：明确指定动作，不做猜测。16 个动作：`invoke` / `toggle` / `select` / `expand` / `collapse` / `scroll_into_view` / `realize` / `default_action` / `set_value` / `set_range` / `focus` / `click_center` / `close` / `maximize` / `minimize` / `restore`。滑块设值、明确展开/收起、只聚焦不点击这些只能靠它。
+- `scroll` 扩成三种用法：`{item}` 把某项滚进视野（不依赖坐标）、`{container_id, direction}` 让容器自己滚、`{x, y}` 滚鼠标滚轮。
+- `act` 新增 `invoke` 与 `scroll {item}` 两种步骤。
+
+改进：
+
+- `click_element` 操作前会自动让控件变得**可达**：虚拟化列表里还没实体化的项先 `Realize`，滚出视野的行先 `ScrollIntoView`。以前遇到这类控件只会报「没有可见区域」。
+- `observe` 触到上限时明确提示「上面列出的不是全部控件」，而不是让模型以为没有别的控件了。
+- 动作失败不再留裸 HRESULT：现在是「`e86d4` 触发失败：…」。模式不支持也不会悄悄降级成点击，而是直说「控件不支持设值（RangeValue，通常是滑块或进度条）」。
+
+安全：
+
+- `read` 不再原样回显控件内容：密码框一律隐藏，文档类控件的正文只报字符数，其余值最长回显 120 字符。桌面自动化很容易顺手把密码、令牌、密钥送进对话上下文。
+
+实测发现（已写进下面「实现要点」）：**WinUI / Electron 应用在后台不实体化 UI Automation 树**——同一个记事本窗口，聚焦前 1 个节点、聚焦后 38 个。不先聚焦就观察，会把「这个软件没有控件树」当成事实。
 
 ### v0.20.1
 
@@ -95,7 +119,10 @@ cargo build --release
 | `list_windows` | 列出顶层窗口：hwnd、标题、类名、进程名、屏幕矩形 |
 | `get_window` | 单个窗口详情 + 该窗口支持的能力层级 |
 | `observe` | 读控件树，每个控件带稳定 id：`e3a1 Button "保存" aid=btnSave @120,340,80x26` |
-| `click_element` | 按 id 触发控件，内部自动选 Invoke / Toggle / Select / Expand / 默认动作 / 点中心 |
+| `find` | 按名称 / AutomationId / 类型 / 类名 / 可用状态查找控件，**只回命中的那些**——不必先把整棵树读回来 |
+| `read` | 读控件当前状态（值 / 开关 / 选中 / 展开 / 范围 / 可用 / 可见 / 焦点 / 矩形），用来确认操作是否生效 |
+| `click_element` | 按 id 触发控件，内部自动选 Invoke / Toggle / Select / Expand / 默认动作 / 点中心；控件不在视野里会先自动滚进来 |
+| `invoke` | 执行明确指定的动作：`invoke`/`toggle`/`select`/`expand`/`collapse`/`scroll_into_view`/`realize`/`default_action`/`set_value`/`set_range`/`focus`/`click_center`/`close`/`maximize`/`minimize`/`restore`。不支持时明确报错，不偷偷换动作 |
 | `set_value` | 按 id 写文本，写完回读校验，不一致自动改走键盘输入 |
 | `act` | 一次调用顺序执行多步（点击/填值/快捷键/等待/等元素/滚动），默认附带结尾截图 |
 | `focus_window` | 切到前台并解除最小化 |
@@ -161,6 +188,9 @@ act {hwnd, steps: [
 - **抢前台**：AttachThreadInput → 临时置顶再取消 → `SwitchToThisWindow` 三层叠加；仍然失败时直接报错，不把按键静默丢给别的窗口。
 - **id 身份校验**：id 由 `hwnd + automationId + name + controlType + className` 哈希得到，缓存里同时记下 observe 时的类型与名称。每次使用前用 `Current*`（不是 `Cached*`）重读一遍比对——`Cached*` 是 observe 那一刻的本地副本，跟它自己比永远相等，读不出任何变化。`Current*` 失败=句柄已被移除或重建，对不上=界面变了，两种情况都明确报错。
 - **退出清理**：stdin 关闭后主动释放缓存的 UIA 元素。留到 `thread_local` 析构时释放会与 OLE32 的线程分离互相等待，进程不再退出。
+- **控件值按需脱敏**：`read` 不会把控件内容原样回给模型——密码框一律隐藏；文档类控件的正文只报字符数；其余值最长回显 120 字符。桌面自动化很容易顺手把密码、令牌、密钥送进对话上下文，这条是刻意的。
+- **动作失败不留裸 HRESULT**：控件上的每个动作都包了一层，失败时是「`e86d4` 触发失败：…」而不是一个 `0x80131509`。模式不支持时也不会悄悄降级成点击，而是明确说「控件不支持设值（RangeValue，通常是滑块或进度条）」。
+- **先聚焦，再观察**：WinUI / Electron 这类应用在**后台不实体化 UI Automation 树**，此时 `observe` / `find` 只能看到窗口本身（`find` 会报「访问 1 个节点」）。所以调用前要先 `focus_window`，否则会误判成「这个软件没有控件树」。实测同一个记事本窗口：聚焦前 1 个节点，聚焦后 38 个。
 
 ## 已知限制
 
@@ -181,8 +211,8 @@ act {hwnd, steps: [
 
 | 阶段 | 内容 | 状态 |
 | --- | --- | --- |
-| P1 语义寻址 | `find` 按名称/类型/ID 查找（只回匹配项）、`read` 读控件当前状态、`observe` 截断提示 | 计划中 |
-| P2 动作矩阵 | 补 ScrollIntoView / VirtualizedItem.Realize / RangeValue / Grid / Window / Transform 等模式；虚拟化列表能滚到第 N 项 | 计划中 |
+| P1 语义寻址 | `find` 按名称/类型/ID 查找（只回匹配项）、`read` 读控件当前状态、`observe` 截断提示 | 已实现 |
+| P2 动作矩阵 | 补 ScrollIntoView / VirtualizedItem.Realize / RangeValue / Window 等模式（`invoke` 工具，16 个动作）；虚拟化列表可滚到第 N 项 | 已实现 |
 | P3 服务端闭环 | `act` 支持控制流与断言、`$1` 引用前一步结果、`wait_for` 多条件、id 失效自动重试 | 计划中 |
 | P4 输入加固 | scancode 输入、相对移动（RawInput 游戏必需）、前台校验、通道自动降级 | 计划中 |
 | P5 视觉句柄化 | 区域截图、模板匹配（自实现金字塔 NCC）、OCR（系统自带 `Windows.Media.Ocr`）、像素探针、差异截图 | 计划中 |

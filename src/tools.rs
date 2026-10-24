@@ -102,14 +102,78 @@ pub fn definitions() -> Value {
             }
         },
         {
-            "name": "click_element",
-            "description": "按 observe 返回的 id 触发控件。内部会依次尝试 Invoke / Toggle / Select / Expand / 默认动作，都不支持时才点控件中心。调用方不需要知道控件类型，也不需要坐标。",
+            "name": "find",
+            "description": "按条件查找控件，只返回命中的那些——不必先把整棵树读回来。适合「保存按钮在哪」「这个对话框里有哪些输入框」这类问题，也绕开了 observe 一次最多 400 个元素的限制。命中的 id 可直接交给 click_element / read / set_value，并且不会冲掉该窗口已有的 id。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "id": { "type": "string", "description": "observe 返回的控件 id，如 e3a1。" }
+                    "hwnd": { "type": "integer", "description": "目标窗口。" },
+                    "name": { "type": "string", "description": "控件名称包含该字符串（忽略大小写）。" },
+                    "exact_name": { "type": "boolean", "description": "true 时名称必须完全相等，默认 false。" },
+                    "automation_id": { "type": "string", "description": "AutomationId 完全相等，例如 ViewMode_LargeIcons。" },
+                    "control_type": { "type": "string", "description": "控件类型，如 Button / Edit / ListItem / MenuItem，也可用数字（50000 = Button）。" },
+                    "class_name": { "type": "string", "description": "控件类名包含该字符串（忽略大小写）。" },
+                    "enabled": { "type": "boolean", "description": "只看可用（true）或只看禁用（false）的控件。" },
+                    "include_offscreen": { "type": "boolean", "description": "是否包含不可见控件，默认 false。" },
+                    "within": { "type": "string", "description": "限定在某个控件的子树里查找，传 observe / find 返回的 id。" },
+                    "max_depth": { "type": "integer", "description": "最大层数，默认 12。" },
+                    "limit": { "type": "integer", "description": "最多返回几个匹配，默认 20。" }
+                },
+                "required": ["hwnd"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "read",
+            "description": "读控件当前状态：值、开关、选中、展开、范围、是否可用/可见/有焦点、矩形。用来确认上一步操作是否真的生效——比再截一张图便宜三个数量级，也不需要换算坐标。传 ids 可以一次读多个。出于安全考虑：密码框内容一律不回显；文档类控件的正文只报字符数、不回显内容；其余值最长回显 120 字符。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "单个控件 id。" },
+                    "ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "多个控件 id；与 id 二选一。"
+                    }
+                },
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "click_element",
+            "description": "按 id 触发控件。内部会依次尝试 Invoke / Toggle / Select / Expand / 默认动作，都不支持时才点控件中心。如果控件不在视野里（滚出去了、或虚拟化列表里没实体化），会先自动滚进来/实体化再操作。调用方不需要知道控件类型，也不需要坐标。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "observe / find 返回的控件 id，如 e3a1。" }
                 },
                 "required": ["id"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "invoke",
+            "description": "对控件执行一个明确指定的动作，不做猜测。什么时候用它而不是 click_element：滑块/进度条设值（set_range）、明确展开或收起（expand/collapse）、把某项滚进视野（scroll_into_view）、窗口最大化/最小化/关闭、只想聚焦不点击（focus）。动作不支持时会明确报错，而不是悄悄换成点击。",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "控件 id。" },
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "invoke", "toggle", "select", "expand", "collapse",
+                            "scroll_into_view", "realize", "default_action",
+                            "set_value", "set_range", "focus", "click_center",
+                            "close", "maximize", "minimize", "restore"
+                        ],
+                        "description": "要执行的动作。"
+                    },
+                    "value": {
+                        "type": "string",
+                        "description": "set_value / set_range 需要的值；set_range 要求是数字。"
+                    }
+                },
+                "required": ["id", "action"],
                 "additionalProperties": false
             }
         },
@@ -128,7 +192,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "act",
-            "description": "一次调用按顺序执行多个步骤，任一步失败即停止（stop_on_error=false 可继续）。这是最省往返的用法：把点击、填值、快捷键、等待、截图合成一次调用。步骤对象用 do 字段区分：click_element{id} / set_value{id,text} / click{x,y,hwnd?} / type_text{text} / press_keys{keys} / scroll{x,y,amount} / wait{ms} / wait_for{name,timeout_ms} / focus_window{hwnd}。默认结束时附带一张截图，用于确认结果。",
+            "description": "一次调用按顺序执行多个步骤，任一步失败即停止（stop_on_error=false 可继续）。这是最省往返的用法：把点击、填值、快捷键、等待、截图合成一次调用。步骤对象用 do 字段区分：click_element{id} / invoke{id,action,value?} / set_value{id,text} / click{x,y,hwnd?} / type_text{text} / press_keys{keys} / scroll{x,y,amount} 或 scroll{item} / wait{ms} / wait_for{name,timeout_ms} / focus_window{hwnd}。默认结束时附带一张截图，用于确认结果。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -205,15 +269,21 @@ pub fn definitions() -> Value {
         },
         {
             "name": "scroll",
-            "description": "在指定位置滚动滚轮。amount 以格为单位，正数向上、负数向下。",
+            "description": "滚动。三种用法：1) 给 item（控件 id）→ 把它滚进视野（虚拟化列表里也能用，不依赖坐标）；2) 给 container_id + direction → 让该容器自己滚动；3) 给 x/y → 在该位置滚鼠标滚轮。amount 以格为单位，正数向上/向前，负数向下/向后。",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "x": { "type": "integer" },
+                    "x": { "type": "integer", "description": "滚轮位置（与 item / container_id 三选一）。" },
                     "y": { "type": "integer" },
-                    "amount": { "type": "integer", "description": "默认 3。" }
+                    "amount": { "type": "integer", "description": "默认 3。" },
+                    "item": { "type": "string", "description": "要滚进视野的控件 id。" },
+                    "container_id": { "type": "string", "description": "要滚动的容器控件 id。" },
+                    "direction": {
+                        "type": "string",
+                        "enum": ["up", "down", "left", "right"],
+                        "description": "配合 container_id 使用，默认 down。"
+                    }
                 },
-                "required": ["x", "y"],
                 "additionalProperties": false
             }
         },
@@ -359,8 +429,8 @@ fn wait_for(hwnd: i64, name: &str, timeout_ms: u64) -> Result<String> {
     let needle = name.to_lowercase();
     let started = std::time::Instant::now();
     loop {
-        if let Ok(nodes) = uia::observe(hwnd, 12, 600, true) {
-            let hit = nodes.iter().any(|node| {
+        if let Ok(found) = uia::observe(hwnd, 12, 600, true) {
+            let hit = found.nodes.iter().any(|node| {
                 node.name.to_lowercase().contains(&needle)
                     || node.automation_id.to_lowercase().contains(&needle)
             });
@@ -383,7 +453,13 @@ fn run_step(step: &Value, default_hwnd: Option<i64>) -> Result<String> {
     match action {
         "click_element" => {
             let id = str_arg(step, "id")?;
-            Ok(uia::activate(id)?.to_string())
+            Ok(uia::activate(id)?)
+        }
+        "invoke" => {
+            let id = str_arg(step, "id")?;
+            let action = str_arg(step, "action")?;
+            let value = step.get("value").and_then(|v| v.as_str());
+            Ok(format!("{id} → {}", uia::invoke(id, action, value)?))
         }
         "set_value" => {
             let id = str_arg(step, "id")?;
@@ -413,10 +489,14 @@ fn run_step(step: &Value, default_hwnd: Option<i64>) -> Result<String> {
             Ok(keys.to_string())
         }
         "scroll" => {
-            let (x, y) = step_point(step)?;
-            let amount = opt_int(step, "amount").unwrap_or(3) as i32;
-            input::scroll(x, y, amount)?;
-            Ok(format!("滚动 {amount} 格"))
+            if let Some(item) = step.get("item").and_then(|v| v.as_str()) {
+                Ok(format!("{item} → {}", uia::scroll_into_view(item)?))
+            } else {
+                let (x, y) = step_point(step)?;
+                let amount = opt_int(step, "amount").unwrap_or(3) as i32;
+                input::scroll(x, y, amount)?;
+                Ok(format!("滚动 {amount} 格"))
+            }
         }
         "wait" => {
             let ms = opt_int(step, "ms").unwrap_or(300).clamp(0, 30_000) as u64;
@@ -536,19 +616,126 @@ pub fn call(params: &Value) -> std::result::Result<Value, (i64, String)> {
                     .get("include_popups")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(true);
-                let nodes = uia::observe(hwnd, depth, max_elements, include_popups)?;
+                let found = uia::observe(hwnd, depth, max_elements, include_popups)?;
                 let info = window::get(hwnd)?;
-                text_result(format!(
+                let mut text = format!(
                     "窗口 \"{}\" hwnd={} 控件 {} 个\n{}",
                     info.title,
                     info.hwnd,
-                    nodes.len(),
-                    uia::render(&nodes)
-                ))
+                    found.nodes.len(),
+                    uia::render(&found.nodes)
+                );
+                if found.truncated {
+                    // 如实说明「上面不是全部」，否则模型会以为没有别的控件了
+                    text.push_str(&format!(
+                        "注意：已达上限（{}），上面列出的不是全部控件。用 find 按条件精确查找，或收窄 max_depth、提高 max_elements。\n",
+                        found.stop_reason.unwrap_or("未知")
+                    ));
+                }
+                text_result(text)
+            }
+            "find" => {
+                let hwnd = int_arg(&args, "hwnd")?;
+                let depth = opt_int(&args, "max_depth").unwrap_or(12).clamp(1, 32) as u32;
+                let limit = opt_int(&args, "limit").unwrap_or(20).clamp(1, 500) as usize;
+                let control_type = match args.get("control_type") {
+                    None => None,
+                    Some(Value::String(name)) => Some(
+                        uia::control_type_from_name(name)
+                            .ok_or_else(|| anyhow!("不认识的控件类型：{name}"))?,
+                    ),
+                    Some(other) => Some(
+                        other
+                            .as_i64()
+                            .ok_or_else(|| anyhow!("control_type 需要字符串或数字"))? as i32,
+                    ),
+                };
+                let filter = uia::Filter {
+                    name: args.get("name").and_then(|v| v.as_str()).map(str::to_string),
+                    exact_name: args
+                        .get("exact_name")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                    automation_id: args
+                        .get("automation_id")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    control_type,
+                    class_name: args
+                        .get("class_name")
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string),
+                    enabled: args.get("enabled").and_then(|v| v.as_bool()),
+                    include_offscreen: args
+                        .get("include_offscreen")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                };
+                let within = args.get("within").and_then(|v| v.as_str());
+                let found = uia::find(hwnd, &filter, within, depth, limit)?;
+                let info = window::get(hwnd)?;
+                let mut text = format!(
+                    "窗口 \"{}\" hwnd={} 命中 {} 个控件（访问 {} 个节点）\n",
+                    info.title,
+                    info.hwnd,
+                    found.nodes.len(),
+                    found.visited
+                );
+                if found.nodes.is_empty() {
+                    text.push_str("没有命中。条件可能太严，或该控件不在这棵 UI Automation 树里。\n");
+                } else {
+                    text.push_str(&uia::render(&found.nodes));
+                }
+                if found.truncated {
+                    text.push_str(&format!(
+                        "注意：已达上限（{}），命中结果可能不完整。用 within 收窄范围或调大 limit。\n",
+                        found.stop_reason.unwrap_or("未知")
+                    ));
+                }
+                text_result(text)
+            }
+            "read" => {
+                let mut ids: Vec<String> = Vec::new();
+                if let Some(id) = args.get("id").and_then(|v| v.as_str()) {
+                    ids.push(id.to_string());
+                }
+                if let Some(list) = args.get("ids").and_then(|v| v.as_array()) {
+                    for item in list {
+                        if let Some(id) = item.as_str() {
+                            ids.push(id.to_string());
+                        }
+                    }
+                }
+                if ids.is_empty() {
+                    bail!("需要 id 或 ids");
+                }
+                let mut lines = Vec::new();
+                let mut failed = 0usize;
+                for id in &ids {
+                    match uia::read_state(id) {
+                        Ok(line) => lines.push(line),
+                        Err(error) => {
+                            failed += 1;
+                            lines.push(format!("{id} 读取失败：{error:#}"));
+                        }
+                    }
+                }
+                if failed == ids.len() {
+                    // 全都没读到：当成错误返回，别让调用方以为读到了
+                    bail!("{}", lines.join("\n"));
+                }
+                text_result(lines.join("\n"))
             }
             "click_element" => {
                 let id = str_arg(&args, "id")?;
                 let how = uia::activate(id)?;
+                text_result(format!("{id} → {how}"))
+            }
+            "invoke" => {
+                let id = str_arg(&args, "id")?;
+                let action = str_arg(&args, "action")?;
+                let value = args.get("value").and_then(|v| v.as_str());
+                let how = uia::invoke(id, action, value)?;
                 text_result(format!("{id} → {how}"))
             }
             "set_value" => {
@@ -590,10 +777,23 @@ pub fn call(params: &Value) -> std::result::Result<Value, (i64, String)> {
                 text_result(format!("已从 ({x1}, {y1}) 拖到 ({x2}, {y2})，耗时 {duration}ms"))
             }
             "scroll" => {
-                let (x, y) = resolve_point(&args)?;
-                let amount = opt_int(&args, "amount").unwrap_or(3) as i32;
-                input::scroll(x, y, amount)?;
-                text_result(format!("已在 ({x}, {y}) 滚动 {amount} 格"))
+                if let Some(item) = args.get("item").and_then(|v| v.as_str()) {
+                    let how = uia::scroll_into_view(item)?;
+                    text_result(format!("{item} → {how}"))
+                } else if let Some(container) = args.get("container_id").and_then(|v| v.as_str()) {
+                    let direction = args
+                        .get("direction")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("down");
+                    let amount = opt_int(&args, "amount").unwrap_or(3);
+                    let how = uia::scroll_container(container, direction, amount)?;
+                    text_result(format!("{container} → {how}"))
+                } else {
+                    let (x, y) = resolve_point(&args)?;
+                    let amount = opt_int(&args, "amount").unwrap_or(3) as i32;
+                    input::scroll(x, y, amount)?;
+                    text_result(format!("已在 ({x}, {y}) 滚动 {amount} 格"))
+                }
             }
             "type_text" => {
                 let text = str_arg(&args, "text")?;
