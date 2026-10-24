@@ -118,4 +118,7 @@ pub fn serve_stdio() {
             let _ = writer.flush();
         }
     }
+    // 读循环结束（stdin 关闭）后先把缓存的 UIA 元素放掉：留到 thread_local
+    // 析构时释放会卡进 OLE32 的线程分离路径，进程就再也不退出了。
+    crate::win::uia::clear_cache();
 }

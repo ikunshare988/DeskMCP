@@ -23,10 +23,31 @@ use windows::Win32::UI::Accessibility::{
 
 use super::{sleep_ms, to_hwnd};
 
+/// 缓存下来的控件句柄，附带 observe 当时记录的身份。
+///
+/// 身份字段不是给模型看的，而是下次用这个 id 之前的比对基准：UIA 的元素句柄会随
+/// 界面变化被回收复用，只凭 id 去点，可能点到同一个位置上换过去的另一个控件。
+#[derive(Clone)]
+struct Cached {
+    hwnd: i64,
+    element: IUIAutomationElement,
+    control_type: i32,
+    name: String,
+}
+
 thread_local! {
     static AUTOMATION: RefCell<Option<IUIAutomation>> = const { RefCell::new(None) };
     // 元素句柄按 id 缓存，模型可以跨多次调用引用同一个控件，不必每次重新观察
-    static CACHE: RefCell<HashMap<String, (i64, IUIAutomationElement, i32)>> = RefCell::new(HashMap::new());
+    static CACHE: RefCell<HashMap<String, Cached>> = RefCell::new(HashMap::new());
+}
+
+/// 退出前释放缓存的控件句柄。
+///
+/// 这些 `IUIAutomationElement` 如果留到进程退出、由 thread_local 析构去 Release，
+/// 会撞进 OLE32 的线程分离路径互相等待：进程永远不退出，只剩一个卡在
+/// `Wait/UserRequest` 的线程。必须在读循环还活着的时候主动清掉。
+pub fn clear_cache() {
+    CACHE.with(|slot| slot.borrow_mut().clear());
 }
 
 fn automation() -> Result<IUIAutomation> {
@@ -230,7 +251,7 @@ pub fn probe_report(hwnd: i64) {
 
 struct WalkState<'a> {
     out: &'a mut Vec<Node>,
-    cache: &'a mut Vec<(String, IUIAutomationElement, i32)>,
+    cache: &'a mut Vec<(String, Cached)>,
     used: HashMap<String, u32>,
     emitted: usize,
     visited: usize,
@@ -318,7 +339,15 @@ unsafe fn walk(
             rect,
             enabled,
         });
-        state.cache.push((id, element.clone(), control_type));
+        state.cache.push((
+            id,
+            Cached {
+                hwnd,
+                element: element.clone(),
+                control_type,
+                name,
+            },
+        ));
         state.emitted += 1;
     }
 
@@ -392,9 +421,9 @@ fn observe_with_walker(
     CACHE.with(|slot| {
         let mut map = slot.borrow_mut();
         // 同一窗口的旧句柄先清掉，避免 id 指向已经消失的控件
-        map.retain(|_, (cached_hwnd, _, _)| *cached_hwnd != hwnd);
-        for (id, element, control_type) in cache {
-            map.insert(id, (hwnd, element, control_type));
+        map.retain(|_, cached| cached.hwnd != hwnd);
+        for (id, cached) in cache {
+            map.insert(id, cached);
         }
     });
     Ok(out)
@@ -470,22 +499,59 @@ pub fn render(nodes: &[Node]) -> String {
     text
 }
 
-fn lookup(id: &str) -> Result<(i64, IUIAutomationElement, i32)> {
-    CACHE
+/// 取出 id 对应的控件，并在使用前确认它还是 observe 时的那个控件。
+fn lookup(id: &str) -> Result<Cached> {
+    let cached = CACHE
         .with(|slot| slot.borrow().get(id).cloned())
-        .ok_or_else(|| anyhow!("找不到控件 {id}：先调用 observe 重新获取，或该控件已消失"))
+        .ok_or_else(|| anyhow!("找不到控件 {id}：先调用 observe 重新获取，或该控件已消失"))?;
+
+    // 身份比对必须走 Current*：Cached* 是 observe 那一刻存下来的本地副本，
+    // 拿它跟它自己比永远相等，读不出任何变化。
+    //
+    // Current* 失败就说明这个句柄已经不可达（控件被销毁，或从树上摘掉换成了新的）。
+    // 这里不能用 Cached* 兜底——那会把「已失效」伪装成「一切正常」，让调用方
+    // 照着过期的位置去操作。
+    let (type_result, name_result) = unsafe {
+        (
+            cached.element.CurrentControlType(),
+            cached.element.CurrentName(),
+        )
+    };
+    let (Ok(live_type), Ok(live_name)) = (type_result, name_result) else {
+        return Err(anyhow!("控件 {id} 已失效（控件已被移除或重建）：请重新 observe"));
+    };
+
+    // id 只保证「observe 那一刻」指向这个控件。界面变了以后 UIA 会把元素句柄回收给
+    // 同一个位置上的另一个控件，照着旧 id 操作就会作用到错的东西上（比如列表换了
+    // 内容之后点到另一行）。对不上就明确报错，不猜也不乱点。
+    if live_type.0 != cached.control_type {
+        return Err(anyhow!(
+            "控件 {id} 已经不是 {} 了（现在是 {}）：界面已变化，请重新 observe",
+            control_type_name(cached.control_type),
+            control_type_name(live_type.0)
+        ));
+    }
+    let live_name = live_name.to_string();
+    if live_name != cached.name {
+        return Err(anyhow!(
+            "控件 {id} 已不是 observe 时的那个（当时 {:?}，现在 {:?}）：界面已变化，请重新 observe",
+            cached.name,
+            live_name
+        ));
+    }
+    Ok(cached)
 }
 
 pub fn rect_of(id: &str) -> Result<(i64, RECT)> {
-    let (hwnd, element, _) = lookup(id)?;
-    let rect = unsafe { element.CurrentBoundingRectangle()? };
-    Ok((hwnd, rect))
+    let cached = lookup(id)?;
+    let rect = unsafe { cached.element.CurrentBoundingRectangle()? };
+    Ok((cached.hwnd, rect))
 }
 
 pub fn focus_element(id: &str) -> Result<()> {
-    let (_, element, _) = lookup(id)?;
+    let cached = lookup(id)?;
     unsafe {
-        element.SetFocus()?;
+        cached.element.SetFocus()?;
     }
     Ok(())
 }
@@ -496,7 +562,9 @@ pub fn focus_element(id: &str) -> Result<()> {
 /// 菜单栏项（MenuItem / SplitButton）例外：它们的 Invoke 和 Expand 都会返回成功
 /// 但界面毫无变化，所以这一类直接走真实点击。
 pub fn activate(id: &str) -> Result<&'static str> {
-    let (_, element, control_type) = lookup(id)?;
+    let cached = lookup(id)?;
+    let element = &cached.element;
+    let control_type = cached.control_type;
     // 菜单项直接真实点击：WinUI 的菜单栏项对 Invoke / Expand 都返回成功，
     // 但界面不会变化，只有真的点一下才会展开
     let prefers_real_click = matches!(control_type, 50011 | 50031);
@@ -590,7 +658,10 @@ unsafe fn content_matches(element: &IUIAutomationElement, text: &str) -> bool {
 /// 不少控件（记事本的正文区、部分 RichEdit）会接受 SetValue 却不真的改内容，
 /// 所以写完要回读一次，对不上就走输入通道，不让调用方去试第二次。
 pub fn set_value(id: &str, text: &str) -> Result<(&'static str, Option<bool>)> {
-    let (hwnd, element, control_type) = lookup(id)?;
+    let cached = lookup(id)?;
+    let hwnd = cached.hwnd;
+    let element = &cached.element;
+    let control_type = cached.control_type;
     // 文档类控件（记事本正文、Word 编辑区）一律走键盘：它们的 ValuePattern
     // 会接受 SetValue 并把值记在属性里，但正文和文件都不会变，无法可靠校验
     let is_document = control_type == 50030;
@@ -606,7 +677,7 @@ pub fn set_value(id: &str, text: &str) -> Result<(&'static str, Option<bool>)> {
                     .unwrap_or(false);
                 if !read_only
                     && pattern.SetValue(&BSTR::from(text)).is_ok()
-                    && content_matches(&element, text)
+                    && content_matches(element, text)
                 {
                     return Ok(("value-pattern", Some(true)));
                 }
@@ -639,7 +710,7 @@ pub fn set_value(id: &str, text: &str) -> Result<(&'static str, Option<bool>)> {
     let verified = unsafe {
         lookup(id)
             .ok()
-            .map(|(_, element, _)| content_matches(&element, text))
+            .map(|cached| content_matches(&cached.element, text))
             .unwrap_or(true)
     };
     // 文档类控件的回读经常滞后或不准（刚输入完 UIA 还是旧内容），
